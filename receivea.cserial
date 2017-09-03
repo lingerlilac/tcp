@@ -1,0 +1,642 @@
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <linux/types.h>
+#include <inttypes.h>
+#include <string.h>
+#include <mysql/mysql.h>
+#include <sys/time.h>
+#include <pthread.h>
+#include "thread1.h"
+#include "hash_lin.h"
+#include "cbuf.h"
+
+// #define buffer_size 100000
+// pthread_mutex_t mutex; 
+// pthread_cond_t cond;
+// pthread_mutex_t mutex_buf;
+// pthread_cond_t cond_buf;
+
+int packet6682 = 0, packet8000 = 0, packet8001 = 0, packet6666 = 0;
+// int written_to_mysql = 0;
+// char *ringbuff[buffer_size];
+// int write_start = 0, write_end = 0;
+// static  cbuf_t cmd;
+
+static __u64 getcurrenttime(void)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec * 1000 + tv.tv_usec / 1000;
+    // return 1;
+}
+
+void reversebytes_uint16t(__u16 *value)
+{
+    *value = (*value & 0x00FF) << 8 |(*value & 0xFF00) >> 8;
+}
+void reversebytes_uint32t(__u32 *value)
+{
+  *value = (*value & 0x000000FFU) << 24 | (*value & 0x0000FF00U) << 8 | 
+    (*value & 0x00FF0000U) >> 8 | (*value & 0xFF000000U) >> 24;
+}
+
+void reversebytes_uint64t(__u64 *value)
+{
+  __u64 low = (*value & 0x00000000FFFFFFFF);
+  __u64 high = (*value & 0xFFFFFFFF00000000) >> 32;
+  __u32 low_32 = (__u32) low;
+  __u32 high_32 = (__u32) high;
+  reversebytes_uint32t(&low_32);
+  reversebytes_uint32t(&high_32);
+  low = ((__u64) low_32) << 32;
+  high = ((__u64) high_32);
+  *value = low | high;
+}
+
+void inttou64(char tmp[], __u64 n)
+{
+  memcpy(tmp, &n, 8);
+}
+
+__u64 chartou64(char a[])
+{
+  __u64 n = 0;
+  memcpy(&n, a, 8);
+  return n;
+}
+
+unsigned long strtou32(char *str) 
+{
+    unsigned long temp=0;
+    unsigned long fact=1;
+    unsigned char len=strlen(str);
+    unsigned char i;
+    for(i=len;i>0;i--)
+    {
+        temp+=((str[i-1]-0x30)*fact);
+        fact*=10;
+    }
+    return temp;
+
+}
+
+void u16tostr(__u16 dat,char *str) 
+{
+    char temp[20];
+    unsigned char i=0,j=0;
+    i=0;
+    while(dat)
+    {
+        temp[i]=dat%10+0x30;
+        i++;
+        dat/=10;
+    }
+    j=i;
+    for(i=0;i<j;i++)
+    {
+      str[i]=temp[j-i-1];
+    }
+    if(!i) 
+    {
+        str[i++]='0';
+    }
+    str[i]=0;
+}
+
+char* mac_tranADDR_toString_r(unsigned char* addr, char* str, size_t size)
+{
+    if(addr == NULL || str == NULL || size < 18) return NULL;
+
+    snprintf(str, size, "%02x:%02x:%02x:%02x:%02x:%02x", 
+             addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
+
+    return str;
+}
+
+void tcp_timeout(void)
+{
+  int i; 
+  __u64 time;
+  while(1)
+  {
+    i = 0; 
+    for(i = 0; i < HASH_TABLE_MAX_SIZE; ++i)
+    {  
+      time = getcurrenttime();
+      if(hashTable[i])  
+      {  
+          HashNode* pHead = hashTable[i];  
+          while(pHead)  
+          {  
+              // printf("duration is %llu, time %llu, pHead->time %llu \n", time - pHead->time, time, pHead->time);
+              if ((time - pHead->time) > 120000)
+              {
+                // printf("remove %s\n", pHead->sKey);
+                printf("size is %d\n", hash_table_size);
+                hash_table_remove(pHead->sKey); 
+              } 
+              pHead = pHead->pNext;  
+          }  
+          // printf("\n");  
+      }
+    }
+  }  
+}
+
+
+
+static void *receive_all(void *arg)
+{
+  const int Port6666 = 6666;
+  const int Win6666 = 1024;
+  const int Reclen6666 = 40;
+  const int Port6682 = 6682;
+  const int Win6682 = 1024;
+  const int Reclen6682 = 72;
+  const int Port8000 = 8000;
+  const int Win8000 = 2048;
+  const int Reclen8000 = 72;
+  const int Port8001 = 8001;
+  const int Win8001 = 2048;
+  const int Reclen8001 = 152;
+
+  struct data_winsize {
+      __be32 ip_src;
+      __be32 ip_dst;
+      __be16 sourceaddr;
+      __be16 destination;
+      __be32 sequence;
+      __be32 ack_sequence;
+      __be16 flags;
+      __be16 windoswsize;
+      __be64 systime;
+      char wscale[3];
+      char pad[5];
+  };
+  struct data_beacon
+  {
+      unsigned char mac_addr[8];
+      unsigned char mac_timestamp[8];
+      unsigned char data_rate[4];
+      unsigned char current_channel[4];
+      unsigned char channel_type[4];
+      unsigned char ssl_signal[4];
+      __u64 time_current;
+      unsigned char bssid[8]; // character array for BSSID and ESSID
+      unsigned char essid[24];
+  };
+  struct data_queue {
+    __u64 time;
+    __u32 queue_id;
+    __u32 pad;
+    __u64 bytes;
+    __u32 packets;
+    __u32 qlen;
+    __u32 backlog;
+    __u32 drops;
+    __u32 requeues;
+    __u32 overlimits;
+    __s32 deficit;
+    __u32 ldelay; 
+    __u32 count;
+    __u32 lastcount;
+    __u32 dropping;
+    __s32 drop_next;
+  };
+  struct data_iw
+  {
+      __u64 time;
+      char mac_addr[24];
+      char device[8];
+      __u32 inactive_time;
+      __u32 rx_bytes;
+      __u32 rx_packets;
+      __u32 tx_bytes;
+      __u32 tx_packets;
+      __u32 tx_retries;
+      __u32 tx_failed;
+      __s32 signal;
+      __s32 signal_avg;
+      __u32 pad;
+      char tx_bitrate[32];
+      char rx_bitrate[32];
+      __u32 expected_throughput;
+      __u32 connected_time;
+
+  };
+
+  //socket_related//
+  struct sockaddr_in addr6666, addr6682, addr8000, addr8001;
+  int sockfd_6666, sockfd_6682, sockfd_8000, sockfd_8001, len = 0;    
+  int addr_len = sizeof(struct sockaddr_in);
+
+  //Reading buffer related//
+  char buffer_6666[Win6666];
+  char buffer_6682[Win6682];
+  char buffer_8000[Win8000];
+  char buffer_8001[Win8001];
+  //receive data structure related//
+  struct data_winsize rdata_winsize;
+  struct data_beacon rdata_beacon;
+  struct data_queue rdata_queue;
+  struct data_iw rdata_iw;
+  //reading controll related //
+  int read_end = 0;
+  int offset = 0;
+
+  //ip processing related//
+  
+  char ip_src[20] = { 0 };
+  char ip_dst[20] = { 0 };
+  __u32 wanip;
+  char mac_addr[18], bssid[18];
+
+  //port processing related//
+  char srcportstr[10] = { 0 };
+  char dstportstr[10] = { 0 };
+
+  //hash processing related//
+
+  //windowscale processing related//
+  int res, kind, length, wscale, cal_windowsize;
+  // connect to socket //
+  if ((sockfd_6666 = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+    perror ("socket");
+    exit(1);
+  }
+  if ((sockfd_6682 = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+    perror ("socket");
+    exit(1);
+  }
+  if ((sockfd_8000 = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+    perror ("socket");
+    exit(1);
+  }
+  if ((sockfd_8001 = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+    perror ("socket");
+    exit(1);
+  }
+
+  memset(&addr6666, 0, sizeof(addr6666));
+  memset(&addr6682, 0, sizeof(addr6682));
+  memset(&addr8000, 0, sizeof(addr8000));
+  memset(&addr8001, 0, sizeof(addr8001));
+  addr6666.sin_family = AF_INET;
+  addr6682.sin_family = AF_INET;
+  addr8000.sin_family = AF_INET;
+  addr8001.sin_family = AF_INET;
+
+  addr6666.sin_port = htons(Port6666);
+  addr6682.sin_port = htons(Port6682);
+  addr8000.sin_port = htons(Port8000);
+  addr8001.sin_port = htons(Port8001);
+
+  addr6666.sin_addr.s_addr = htonl(INADDR_ANY);
+  addr6682.sin_addr.s_addr = htonl(INADDR_ANY);
+  addr8000.sin_addr.s_addr = htonl(INADDR_ANY);
+  addr8001.sin_addr.s_addr = htonl(INADDR_ANY);
+
+  if (bind(sockfd_6666, (struct sockaddr *)&addr6666, sizeof(addr6666))<0) {
+      perror("connect6666");
+      exit(1);
+  }
+
+  if (bind(sockfd_6682, (struct sockaddr *)&addr6682, sizeof(addr6682))<0) {
+      perror("connect82");
+      exit(1);
+  }
+
+  if (bind(sockfd_8000, (struct sockaddr *)&addr8000, sizeof(addr8000))<0) {
+      perror("connect8000");
+      exit(1);
+  }
+
+  if (bind(sockfd_8001, (struct sockaddr *)&addr8001, sizeof(addr8001))<0) {
+      perror("connect8001");
+      exit(1);
+  }
+
+  
+
+  //time related //
+  __u64 mac_timestamp, time;
+
+  //temp variable
+  signed char data_rate;
+  // channel realted//
+  int current_channel, ssl_signal;
+  char channel_type[] = "802.11a";
+  //throughput calculating
+  __u32 expected_throughput_tmp;
+  float expected_throughput;
+
+  //string used to store data
+  char insert_data[1000];
+  int i = 0;
+  
+  while(1)
+  {
+    while(1) 
+      { 
+        char str[40];
+        unsigned char *ptr_uc;
+        // ptr_uc = malloc(sizeof(__be32));
+        printf("6666\n");
+        memset(buffer_6666, 0, sizeof(buffer_6666));
+        len = recvfrom(sockfd_6666, buffer_6666, sizeof(buffer_6666), 0, 
+                       (struct sockaddr *)&addr6666 ,&addr_len);
+        
+        if (len!=-1)
+          packet6666++;
+        else
+          break;
+
+        read_end = Win6666;
+        offset = 0;
+
+        while((read_end > (offset + Reclen6666)))
+        {
+          memcpy(&rdata_winsize, buffer_6666+offset, Reclen6666);
+          if(rdata_winsize.systime !=0)
+          {
+
+            offset = offset + Reclen6666;
+            reversebytes_uint32t(&rdata_winsize.ip_src);
+            reversebytes_uint32t(&rdata_winsize.ip_dst);
+            reversebytes_uint16t(&rdata_winsize.sourceaddr);
+            reversebytes_uint16t(&rdata_winsize.destination);
+            reversebytes_uint32t(&rdata_winsize.sequence);
+            reversebytes_uint32t(&rdata_winsize.ack_sequence);
+            reversebytes_uint16t(&rdata_winsize.flags);
+            reversebytes_uint16t(&rdata_winsize.windoswsize);
+            reversebytes_uint64t(&rdata_winsize.systime);
+            
+            ptr_uc = (unsigned char *)&rdata_winsize.ip_src;
+            sprintf(ip_src,"%u.%u.%u.%u", ptr_uc[3], ptr_uc[2], ptr_uc[1], ptr_uc[0]);
+            ptr_uc = (unsigned char *)&rdata_winsize.ip_dst;
+            sprintf(ip_dst,"%u.%u.%u.%u", ptr_uc[3], ptr_uc[2], ptr_uc[1], ptr_uc[0]);
+            kind = (int)(rdata_winsize.wscale[0]);
+            length = (int) rdata_winsize.wscale[1];
+            wscale = (int) rdata_winsize.wscale[2];
+
+            rdata_winsize.flags = rdata_winsize.flags & 0x0017;
+            cal_windowsize = rdata_winsize.windoswsize;
+            u16tostr(rdata_winsize.sourceaddr, srcportstr);
+            u16tostr(rdata_winsize.destination, dstportstr);
+            
+            if (rdata_winsize.flags == 2 || rdata_winsize.flags == 18)
+            {
+                sprintf(str, "%s%s%s%s%s", inet_ntoa(addr6666.sin_addr), ip_src, ip_dst, srcportstr, dstportstr);
+                // printf("insert%s\n", str);
+                time = getcurrenttime();
+                hash_table_insert(str, wscale, time);
+            }
+            else if (rdata_winsize.flags == 17 || rdata_winsize.flags & 0x0004 == 1)
+            {
+                // printf("rdata_winsize.flags is %u\n", rdata_winsize.flags);
+                sprintf(str, "%s%s%s%s%s", inet_ntoa(addr6666.sin_addr), ip_src, ip_dst, srcportstr, dstportstr);
+                // printf("del%s\n", str);
+                if (hash_table_lookup(str) != NULL)
+                {
+                    hash_table_remove(str);
+                }
+                sprintf(str, "%s%s%s%s%s", inet_ntoa(addr6666.sin_addr), ip_dst, ip_src, dstportstr, srcportstr);
+                // printf("del%s\n", str);
+                if (hash_table_lookup(str) != NULL)
+                {
+                    hash_table_remove(str);
+                }
+            }
+
+            else if (rdata_winsize.flags == 16)
+            {
+                time = getcurrenttime();
+                sprintf(str, "%s%s%s%s%s", inet_ntoa(addr6666.sin_addr), ip_src, ip_dst, srcportstr, dstportstr);
+                // printf("cal_windowsize %s\n", str);
+                if (hash_table_lookup(str) != NULL)
+                {
+                    cal_windowsize = rdata_winsize.windoswsize << hash_table_lookup(str)->nValue;
+                    hash_table_lookup(str)->time = time;
+                } 
+                else
+                {
+                    time = getcurrenttime();
+                    hash_table_insert(str, wscale, time);
+                }               
+            }
+
+            sprintf(insert_data, "INSERT INTO winsize(mac_addr, ip_src, ip_dst, srcport, dstport, sequence, ack_sequence, windowsize, cal_windowsize, systime, flags, kind, length, wscale) VALUES(\"%s\", \"%s\",\"%s\", %u, %u, %u, %u, %u, %u, %llu, %u, %u, %u, %u)", mac_addr, ip_src, ip_dst, rdata_winsize.sourceaddr, rdata_winsize.destination, rdata_winsize.sequence, rdata_winsize.ack_sequence, rdata_winsize.windoswsize, cal_windowsize, rdata_winsize.systime, rdata_winsize.flags, kind, length, wscale);
+          }
+          else
+            offset = 2 * Win6666;
+        }
+        time = getcurrenttime();
+        if ((time % 10000) == 0)
+        {
+          tcp_timeout();
+        }
+        // if (ptr_uc)
+        // {
+        //   free(ptr_uc);
+        // }
+
+      }
+
+
+    ////////////////////////////while 6682///////////////
+    while(1) 
+      { 
+        memset(&rdata_beacon, 0, sizeof(rdata_beacon));
+        memset(buffer_6682, 0, sizeof(buffer_6682));
+        len = recvfrom(sockfd_6682, buffer_6682, sizeof(buffer_6682), 0, 
+                       (struct sockaddr *)&addr6682 ,&addr_len);
+        printf("6682\n");
+        i = 0;
+        if (len != -1)
+          packet6682 ++;
+        else
+          break;
+
+        offset = 0;
+        read_end = Win6682;
+
+        while((read_end > (offset + Reclen6682)))
+        {
+          i = 0;
+          memcpy(&rdata_beacon, buffer_6682+offset, Reclen6682);
+          if(rdata_beacon.time_current !=0)
+          {
+            offset = offset + Reclen6682;
+            reversebytes_uint64t(&rdata_beacon.time_current);
+            time = rdata_beacon.time_current;
+            mac_timestamp = 0;
+            memcpy(&mac_timestamp, rdata_beacon.mac_timestamp, 8);;
+            ssl_signal = (signed char)rdata_beacon.ssl_signal[0];
+            current_channel = (int)rdata_beacon.current_channel[1] * 256 + (int)rdata_beacon.current_channel[0];
+            data_rate = (int)rdata_beacon.data_rate[0];
+            mac_tranADDR_toString_r(rdata_beacon.mac_addr, mac_addr, sizeof(mac_addr));
+            mac_tranADDR_toString_r(rdata_beacon.bssid, bssid, sizeof(bssid));
+
+            if ((int)rdata_beacon.channel_type[0] == 160 && (int)rdata_beacon.channel_type[1] == 0)
+            {
+              strcpy(channel_type, "802.11b");
+            }
+            else if ((int)rdata_beacon.channel_type[0] == 192 && (int)rdata_beacon.channel_type[1] == 0)
+            {
+              strcpy(channel_type, "802.11g");
+            }
+            snprintf(insert_data, 300, "INSERT INTO rdata_beacon(time, mac_timestamp, data_rate, current_channel, channel_type, ssl_signal, bw, mac_addr, bssid, essid) VALUES(%llu, %llu, %d, %d, \"%s\", %d, %d,  \"%s\",  \"%s\", \"%s\")", time, mac_timestamp, data_rate, current_channel, channel_type, ssl_signal, 0, mac_addr, bssid, rdata_beacon.essid);
+          }
+          else
+            offset = 2* Win6682;
+        }
+      }
+    ////////////////////////while 8000/////////////////
+    while(1) 
+    {     
+      memset(buffer_8000, 0, sizeof(buffer_8000));
+      len = recvfrom(sockfd_8000, buffer_8000, sizeof(buffer_8000), 0, 
+                     (struct sockaddr *)&addr8000 ,&addr_len);
+      printf("8000\n");
+      if (len != -1)
+        packet8000++;
+      else
+        break;
+      offset = 0;
+      read_end = Win8000;
+
+      while((read_end > (offset + Reclen8000)))
+      {
+        memcpy(&rdata_queue, buffer_8000+offset, Reclen8000);
+        if(rdata_queue.time !=0)
+        {
+
+          offset = offset + Reclen8000;
+          reversebytes_uint64t(&rdata_queue.bytes);
+          reversebytes_uint64t(&rdata_queue.time);        
+          reversebytes_uint32t(&rdata_queue.queue_id);
+          reversebytes_uint32t(&rdata_queue.packets);
+          reversebytes_uint32t(&rdata_queue.qlen);
+          reversebytes_uint32t(&rdata_queue.backlog);
+          reversebytes_uint32t(&rdata_queue.drops);
+          reversebytes_uint32t(&rdata_queue.requeues);
+          reversebytes_uint32t(&rdata_queue.overlimits);
+          reversebytes_uint32t(&rdata_queue.deficit);
+          reversebytes_uint32t(&rdata_queue.ldelay);
+          reversebytes_uint32t(&rdata_queue.count);
+          reversebytes_uint32t(&rdata_queue.lastcount);
+          reversebytes_uint32t(&rdata_queue.dropping);
+          reversebytes_uint32t(&rdata_queue.drop_next);
+
+          sprintf(insert_data, "INSERT INTO queue(mac_ddr, time, queue_id, bytes, packets, qlen, backlog, drops, requeues, overlimits, deficit, ldelay, count, lastcount, dropping, drop_next) VALUES(\"%s\", %llu, %u, %llu, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d ,%d ,%d)", mac_addr, rdata_queue.time, rdata_queue.queue_id, rdata_queue.bytes, rdata_queue.packets, rdata_queue.qlen, rdata_queue.backlog, rdata_queue.drops, rdata_queue.requeues, rdata_queue.overlimits, rdata_queue.deficit, rdata_queue.ldelay, rdata_queue.count, rdata_queue.lastcount, rdata_queue.dropping, rdata_queue.drop_next);
+        }
+        else
+          offset = 2* Win8000;
+      }
+    }
+    /////////////////////////while8001////////////
+    while(1) 
+      { 
+        char insert_data[1000];
+        
+
+        memset(buffer_8001, 0, sizeof(buffer_8001));
+        len = recvfrom(sockfd_8001, buffer_8001, sizeof(buffer_8001), 0, 
+                       (struct sockaddr *)&addr8001 ,&addr_len);
+        
+        printf("8001\n");
+        if (len != -1)
+          packet8001++;
+        else
+          break;
+        read_end = Win8001;
+        offset = 0;
+        while((read_end > (offset + Reclen8001)))
+        {
+          memcpy(&rdata_iw, buffer_8001+offset, Reclen8001);
+          if(rdata_iw.time !=0)
+          {
+            char a[10] = {0};
+            offset = offset + Reclen8001;
+            reversebytes_uint64t(&rdata_iw.time);
+            inttou64(a, rdata_iw.time);
+            reversebytes_uint32t(&rdata_iw.inactive_time);
+            reversebytes_uint32t(&rdata_iw.rx_bytes);
+            reversebytes_uint32t(&rdata_iw.rx_packets);
+            reversebytes_uint32t(&rdata_iw.tx_bytes);
+            reversebytes_uint32t(&rdata_iw.tx_packets);
+            reversebytes_uint32t(&rdata_iw.tx_retries);
+            reversebytes_uint32t(&rdata_iw.tx_failed);
+            reversebytes_uint32t(&rdata_iw.connected_time);
+            reversebytes_uint32t(&rdata_iw.signal);
+            reversebytes_uint32t(&rdata_iw.signal_avg);
+            reversebytes_uint32t(&rdata_iw.expected_throughput);
+            expected_throughput_tmp = rdata_iw.expected_throughput;
+            expected_throughput = (float)expected_throughput_tmp / 1000.0;
+            a[9] = '\0';
+
+            sprintf(insert_data, "INSERT INTO iw(Station, time, mac_addr, device, inactive_time, rx_bytes, rx_packets,tx_bytes, tx_packets, tx_retries, tx_failed, signel, signal_avg, tx_bitrate,rx_bitrate, expected_throughput, connected_time) VALUES(\"%s\", %llu, \"%s\", \"%s\", %d, %d, %d, %d,%d, %d, %d, %d, %d, \"%s\", \"%s\", %f, %d)", mac_addr, rdata_iw.time, rdata_iw.mac_addr, rdata_iw.device, rdata_iw.inactive_time, rdata_iw.rx_bytes, rdata_iw.rx_packets, rdata_iw.tx_bytes, rdata_iw.tx_packets, rdata_iw.tx_retries, rdata_iw.tx_failed, rdata_iw.signal, rdata_iw.signal_avg, rdata_iw.tx_bitrate, rdata_iw.rx_bitrate, expected_throughput,  rdata_iw.connected_time);
+            // printf("%s\n", insert_data);
+            // cbuf_enqueue(&cmd, insert_data);
+          }
+          else
+            offset = 2* Win8001;
+        }
+        usleep(10000);
+      }
+  }
+}
+
+int main()
+{
+  
+  // pthread_t tid1, tid2, tid3, tid4, tid5, tid6;
+  pthread_t tid1 = 0, err = 0, i = 0;
+  // int init_mutex = 0, err, init_mutex_buf = 0;
+  // int i;
+  // for (i= 0; i< buffer_size; i++)
+  // {
+  //   ringbuff[i] = (char *)malloc(300);
+  // }
+  // cbuf_init(&cmd);
+  // init_mutex_buf = pthread_mutex_init(&mutex_buf, NULL);
+  // init_mutex = pthread_mutex_init(&mutex, NULL);
+  // pthread_cond_init(&cond, NULL);
+  // pthread_cond_init(&cond_buf, NULL);
+  hash_table_init();
+  
+  err = pthread_create(&tid1, NULL, receive_all, NULL);
+  if(err != 0)
+  {
+    printf("receive_all%d creation failed \n", i);
+    exit(1);
+  }
+
+  // err = pthread_create(&tid5, NULL, insertmysql, NULL);
+  // if(err != 0)
+  // {
+  //   printf("insertmysql%d creation failed \n", i);
+  //   exit(1);
+  // }
+  // err = pthread_create(&tid6, NULL, tcp_timeout, NULL);
+  // if(err != 0)
+  // {
+  //   printf("tcp_timeout%d creation failed \n", i);
+  //   exit(1);
+  // }
+
+  pthread_exit(0);
+  hash_table_release();
+  // pthread_cond_destroy(&cond_buf);
+  // pthread_cond_destroy(&cond);
+  // pthread_mutex_destroy(&mutex);
+  // pthread_mutex_destroy(&mutex_buf);
+  // cbuf_destroy(&cmd);
+  return 0;
+}

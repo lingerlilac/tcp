@@ -1,0 +1,12 @@
+objects =  receivea.o thread1.o cbuf.o
+
+helloworld: $(objects)
+	gcc -o receivea $(objects)  -lpthread -L/usr/lib/mysql -lmysqlclient
+receivea.o: receivea.c thread1.h cbuf.h
+	gcc -c receivea.c  -lpthread 
+thread1.o: thread1.c thread1.h
+	gcc -c thread1.c  -lpthread
+cbuf.o: cbuf.c cbuf.h thread1.h
+	gcc -c cbuf.c  -lpthread
+clean:
+	rm -f *.o receivea
